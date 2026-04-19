@@ -1,48 +1,26 @@
-# Environment variables
-.env
-.env.local
-.env.*.local
-
-# Dependencies
-node_modules/
+# Virtual Environment (The 5GB of files)
+.venv/
 venv/
 env/
-*.egg-info/
-dist/
-build/
+ENV/
 
-# Logs
-logs/
-*.log
-npm-debug.log*
-yarn-debug.log*
-yarn-error.log*
+# Python Bytecode (Generated speed-up files)
+__pycache__/
+*.py[cod]
+*$py.class
 
-# Runtime
-.node
-*.pid
-*.seed
-*.pid.lock
+# Local Environment Secrets (API keys, DB URLs)
+.env
 
-# IDE
+# AI/Machine Learning artifacts
+.cache/
+.huggingface/
+
+# IDE Specifics
 .vscode/
 .idea/
-*.swp
-*.swo
-*~
-.DS_Store
-Thumbs.db
 
-# Testing
-coverage/
-.nyc_output/
-htmlcov/
-
-# Build output
+# Distribution / Build
 dist/
 build/
-*.tsbuildinfo
-
-# OS
-.DS_Store
-Thumbs.db
+*.egg-info/

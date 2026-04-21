@@ -39,15 +39,21 @@ def load_settings() -> Settings:
     if app_env not in {"dev", "prod"}:
         raise ValueError("APP_ENV must be 'dev' or 'prod'")
 
-    default_origins = "*" if app_env == "dev" else ""
-    raw_origins = os.getenv("CORS_ALLOW_ORIGINS", default_origins)
-    cors_allow_origins = ["*"] if raw_origins.strip() == "*" else _parse_csv(raw_origins)
+    # In dev mode, allow all origins. In prod, require explicit configuration.
+    if app_env == "dev":
+        cors_allow_origins = ["*"]
+    else:
+        raw_origins = os.getenv("CORS_ALLOW_ORIGINS", "")
+        cors_allow_origins = _parse_csv(
+            raw_origins) if raw_origins.strip() else []
 
     return Settings(
         app_env=app_env,
-        model_name=os.getenv("MODEL_NAME", "sentence-transformers/all-MiniLM-L6-v2"),
-        ollama_url=os.getenv("OLLAMA_URL", "http://localhost:11434/api/generate"),
-        ollama_model=os.getenv("OLLAMA_MODEL", "phi3"),
+        model_name=os.getenv(
+            "MODEL_NAME", "sentence-transformers/all-MiniLM-L6-v2"),
+        ollama_url=os.getenv(
+            "OLLAMA_URL", "http://localhost:11434/api/generate"),
+        ollama_model=os.getenv("OLLAMA_MODEL", "gemma4:e2b"),
         products_url=os.getenv(
             "PRODUCTS_URL",
             "https://raw.githubusercontent.com/n8nintegrationai/luvz-collection-dev/refs/heads/main/public/data/products.json",

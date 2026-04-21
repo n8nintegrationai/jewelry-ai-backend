@@ -1,37 +1,92 @@
 import re
-from collections import Counter
 
 import numpy as np
 
 from app_config import settings
 from app_constants import NO_RESULTS_MESSAGE, SYSTEM_PROMPT
 from dependencies import runtime
-from query_classifier import QueryTier, classify_query, get_clarifying_question, should_add_clarifying_question
+from query_classifier import QueryTier, get_clarifying_question, should_add_clarifying_question
 
 
 def _normalize_text(value: str) -> str:
     return re.sub(r"[^a-z0-9]+", " ", value.lower()).strip()
 
 
-def _format_price(raw_price: object) -> str:
-    value = str(raw_price or "").strip()
-    normalized = value.lower()
-    if normalized in {"", "0", "none", "consult"}:
-        return "Available on Request"
+def extract_constraints(message: str, previous_assistant_message: str = "") -> dict:
+    """
+    Extract price constraints from user message.
 
-    numeric = value.replace(",", "")
-    try:
-        if float(numeric) <= 0:
-            return "Available on Request"
-    except ValueError:
-        return "Available on Request"
+    Handles patterns:
+    - "budget 500" or "budget of 500"
+    - "500 budget"
+    - "my budget is 500"
+    - "budget around 500"
+    - "around 500"
+    - "roughly 500"
+    - "500 rupees" / "500 rs" / "rs 500" / "₹500" / "500₹"
+    - Standalone number when previous message mentions budget/price keywords
 
-    return f"Rs. {value}"
+    Args:
+        message: User's message (case-insensitive matching)
+        previous_assistant_message: Previous assistant response for context
 
+    Returns:
+        Dict with 'max_price' key (or empty dict if no price found)
+    """
+    msg_lower = message.lower().strip()
 
-def _format_product_line(hit: dict) -> str:
-    name = hit.get("name", "Product")
-    return f"{name} - {_format_price(hit.get('price'))}"
+    # Pattern 1: "budget 500" or "budget of 500"
+    match = re.search(r'budget\s+(?:of\s+)?(\d+)', msg_lower)
+    if match:
+        return {"max_price": int(match.group(1))}
+
+    # Pattern 2: "500 budget"
+    match = re.search(r'(\d+)\s+budget', msg_lower)
+    if match:
+        return {"max_price": int(match.group(1))}
+
+    # Pattern 3: "my budget is 500"
+    match = re.search(r'my\s+budget\s+is\s+(\d+)', msg_lower)
+    if match:
+        return {"max_price": int(match.group(1))}
+
+    # Pattern 4: "budget around 500"
+    match = re.search(r'budget\s+around\s+(\d+)', msg_lower)
+    if match:
+        return {"max_price": int(match.group(1))}
+
+    # Pattern 5: "around 500" or "roughly 500"
+    match = re.search(r'(?:around|roughly|approximately)\s+(\d+)', msg_lower)
+    if match:
+        return {"max_price": int(match.group(1))}
+
+    # Pattern 6a: "rs 500" or "rs. 500" or "rupees 500"
+    match = re.search(r'(?:rs\.?|rupees?)\s+(\d+)', msg_lower)
+    if match:
+        return {"max_price": int(match.group(1))}
+
+    # Pattern 6b: "500 rupees" or "500 rs" or "500₹" or "₹500"
+    match = re.search(r'(?:₹\s*)?(\d+)\s*(?:rupees?|rs\.?|₹)?', msg_lower)
+    if match:
+        # Only return if we found rupees/rs in the message to avoid false positives
+        if re.search(r'(\d+)\s*(?:rupees?|rs\.?|₹)|₹\s*(\d+)|(\d+)\s*₹', msg_lower):
+            return {"max_price": int(match.group(1))}
+
+    # Pattern 7: Standalone number when previous message mentioned budget keywords
+    budget_keywords = ["budget", "price", "range", "narrow", "style"]
+    prev_lower = previous_assistant_message.lower()
+    if any(keyword in prev_lower for keyword in budget_keywords):
+        # Check if message is just a number
+        stripped = msg_lower.strip()
+        if re.match(r'^\d+$', stripped):
+            return {"max_price": int(stripped)}
+
+    # Pattern 8: "under 500"
+    match = re.search(r'under\s+(\d+)', msg_lower)
+    if match:
+        return {"max_price": int(match.group(1))}
+
+    return {}
 
 
 def _product_identity(hit: dict) -> tuple[object, str, str, str]:
@@ -88,7 +143,7 @@ def find_exact_name_matches(query: str) -> list[dict]:
     ]
 
 
-def cosine_search(query: str, k: int | None = None, tier: QueryTier | None = None) -> list[dict]:
+def cosine_search(query: str, k: int | None = None, tier: QueryTier | None = None, original_query: str | None = None, constraints: dict | None = None) -> list[dict]:
     """
     Search catalog using cosine similarity.
 
@@ -97,6 +152,8 @@ def cosine_search(query: str, k: int | None = None, tier: QueryTier | None = Non
         k: Number of results to return (defaults to settings.top_k)
         tier: Query tier (TIER1_EXACT, TIER2_SEMANTIC, or TIER3_AMBIGUOUS)
               For TIER3, always returns top K items even if similarity is low
+        original_query: The original unmodified query (for TIER2 validation)
+        constraints: Dict with max_price, category, etc. for filtering
 
     Returns:
         List of matching products, never empty for TIER3
@@ -107,27 +164,97 @@ def cosine_search(query: str, k: int | None = None, tier: QueryTier | None = Non
     limit = k or settings.top_k
     qvec = runtime.embed_model.encode([query], normalize_embeddings=True)[0]
     semantic_scores = runtime.catalog_vecs @ qvec
-    lexical_scores = np.array([_lexical_boost(query, product) for product in runtime.catalog], dtype=np.float32)
+    lexical_scores = np.array([_lexical_boost(query, product)
+                              for product in runtime.catalog], dtype=np.float32)
     scores = semantic_scores + lexical_scores
 
     # For TIER3 (ambiguous), always return top K items regardless of threshold
     if tier == QueryTier.TIER3_AMBIGUOUS:
         top_idx = np.argsort(scores)[::-1][:limit]
-        return [runtime.catalog[i] for i in top_idx]
+        hits = [runtime.catalog[i] for i in top_idx]
+    else:
+        # For TIER1 and TIER2, apply threshold
+        valid_indices = np.where(
+            semantic_scores >= settings.similarity_threshold)[0]
+        if len(valid_indices) == 0:
+            valid_indices = np.where(lexical_scores > 0)[0]
+        if len(valid_indices) == 0:
+            hits = []
+        else:
+            # For TIER2 (semantic/occasion), validate against original query to avoid irrelevant results
+            if tier == QueryTier.TIER2_SEMANTIC and original_query:
+                original_qvec = runtime.embed_model.encode(
+                    [original_query], normalize_embeddings=True)[0]
+                original_semantic_scores = runtime.catalog_vecs @ original_qvec
 
-    # For TIER1 and TIER2, apply threshold
-    valid_indices = np.where(semantic_scores >= settings.similarity_threshold)[0]
-    if len(valid_indices) == 0:
-        valid_indices = np.where(lexical_scores > 0)[0]
-    if len(valid_indices) == 0:
-        return []
+                # Filter results to only include items that are relevant to BOTH the enriched and original query
+                # This prevents "car price" from matching jewelry just because it has "silver"
+                min_original_threshold = max(
+                    0.35, settings.similarity_threshold - 0.1)
+                valid_indices = valid_indices[original_semantic_scores[valid_indices]
+                                              >= min_original_threshold]
 
-    top_idx = valid_indices[np.argsort(scores[valid_indices])[::-1][:limit]]
-    return [runtime.catalog[i] for i in top_idx]
+                if len(valid_indices) == 0:
+                    hits = []
+                else:
+                    top_idx = valid_indices[np.argsort(
+                        scores[valid_indices])[::-1][:limit]]
+                    hits = [runtime.catalog[i] for i in top_idx]
+            else:
+                top_idx = valid_indices[np.argsort(
+                    scores[valid_indices])[::-1][:limit]]
+                hits = [runtime.catalog[i] for i in top_idx]
+
+    # Apply price filter if constraints provided
+    if constraints and constraints.get("max_price"):
+        max_price = constraints["max_price"]
+        filtered_hits = []
+        for hit in hits:
+            price_str = str(hit.get("price", "")).replace(",", "")
+            try:
+                price = float(price_str)
+                if price <= max_price:
+                    filtered_hits.append(hit)
+            except ValueError:
+                # If price not parseable, include it
+                filtered_hits.append(hit)
+
+        # If filter leaves fewer than 2 results, relax by 20%
+        if len(filtered_hits) < 2 and max_price > 0:
+            relaxed_price = max_price * 1.2
+            filtered_hits = []
+            for hit in hits:
+                price_str = str(hit.get("price", "")).replace(",", "")
+                try:
+                    price = float(price_str)
+                    if price <= relaxed_price:
+                        filtered_hits.append(hit)
+                except ValueError:
+                    filtered_hits.append(hit)
+
+        # Never return empty results - if still empty, return original hits
+        if not filtered_hits:
+            filtered_hits = hits
+
+        hits = filtered_hits
+
+    return hits
 
 
 def build_context(hits: list[dict]) -> str:
-    return "\n".join(_format_product_line(hit) for hit in hits)
+    entries: list[str] = []
+    for index, hit in enumerate(hits, start=1):
+        entries.append(
+            "\n".join(
+                [
+                    f"Item {index}",
+                    f"Name: {hit.get('name', 'Product')}",
+                    f"Price: {_format_price(hit.get('price'))}",
+                    f"Description: {_format_description(hit.get('description'))}",
+                ]
+            )
+        )
+    return "\n\n".join(entries)
 
 
 def build_sources(hits: list[dict]) -> list[dict]:
@@ -145,24 +272,17 @@ def build_sources(hits: list[dict]) -> list[dict]:
 
 
 def build_llm_payload(message: str, context: str, exact_match: bool, tier: QueryTier | None = None) -> dict:
-    """
-    Build LLM payload in Phi-3 format.
-
-    Args:
-        message: Original user message
-        context: Product inventory context
-        exact_match: Whether this was an exact name match
-        tier: Query tier (used for mode setting)
-    """
     mode = "exact_match" if exact_match else "suggestions"
-
-    # Use Phi-3 format: <|system|>...<|end|><|user|>...<|end|><|assistant|>
+    tier_name = tier.value if tier else "semantic"
     prompt = (
-        f"<|system|>{SYSTEM_PROMPT}<|end|>"
-        f"<|user|>MODE: {mode}\n"
+        "system\n"
+        f"{SYSTEM_PROMPT}\n\n"
+        "user\n"
+        f"TIER: {tier_name}\n"
+        f"MODE: {mode}\n"
+        f"CUSTOMER_MESSAGE: {message}\n\n"
         f"INVENTORY:\n{context}\n\n"
-        f"Customer: {message}<|end|>"
-        f"<|assistant|>"
+        "assistant\n"
     )
 
     return {
@@ -170,44 +290,79 @@ def build_llm_payload(message: str, context: str, exact_match: bool, tier: Query
         "prompt": prompt,
         "stream": False,
         "options": {
-            "temperature": 0.0,
-            "stop": ["<|end|>", "User:", "Assistant:", "INSTRUCTIONS:", "Inventory:", "User Request:", "\n\n\n", "---", "<a", "http"],
-            "num_predict": 150,
+            "temperature": 0.2,
+            "stop": ["\nuser\n", "\nsystem\n"],
+            "num_predict": 220,
         },
     }
 
 
-def validate_llm_answer(answer: str, hits: list[dict], exact_match: bool, tier: QueryTier | None = None) -> str:
-    del exact_match
+def _fallback_reason(hit: dict) -> str:
+    description = _format_description(hit.get("description"))
+    if description == "No description provided.":
+        return "This is a lovely option from our silver jewelry collection."
+    return description
 
-    allowed_lines = [_format_product_line(hit) for hit in hits]
-    if not allowed_lines:
+
+def _build_fallback_answer(hits: list[dict], tier: QueryTier | None = None) -> str:
+    if not hits:
         return NO_RESULTS_MESSAGE
 
-    allowed_counter = Counter(allowed_lines)
-    allowed_lookup = {_normalize_text(line): line for line in allowed_counter}
+    if tier == QueryTier.TIER3_AMBIGUOUS:
+        lines = ["Here are 5 popular picks you can start with:"]
+        lines.extend(_format_product_line(hit) for hit in hits[:5])
+        question = get_clarifying_question(tier)
+        if question:
+            lines.append("")
+            lines.append(question)
+        return "\n".join(lines)
 
-    raw_lines = [line.strip() for line in answer.splitlines() if line.strip()]
-    if not raw_lines:
-        result = build_context(hits)
-    else:
-        selected: list[str] = []
-        selected_counter: Counter[str] = Counter()
+    if tier == QueryTier.TIER2_SEMANTIC:
+        lines = ["These are lovely curated picks for your occasion:"]
+        for hit in hits:
+            lines.append(
+                f"{_format_product_line(hit)} - {_fallback_reason(hit)}")
+        lines.append(
+            "If you want, I can narrow these down for a specific style or budget.")
+        return "\n".join(lines)
 
-        for line in raw_lines:
-            if " - " not in line:
-                continue
+    lines = ["These are beautiful matches from our collection:"]
+    lines.extend(_format_product_line(hit) for hit in hits)
+    lines.append(
+        "If you'd like, I can also show matching pieces in a similar style.")
+    return "\n".join(lines)
 
-            allowed_line = allowed_lookup.get(_normalize_text(line))
-            if allowed_line and selected_counter[allowed_line] < allowed_counter[allowed_line]:
-                selected.append(allowed_line)
-                selected_counter[allowed_line] += 1
 
-        result = "\n".join(selected) if selected else build_context(hits)
+def _mentions_known_product(answer: str, hits: list[dict]) -> bool:
+    normalized_answer = _normalize_text(answer)
+    return any(_normalize_text(str(hit.get("name", ""))) in normalized_answer for hit in hits)
 
-    # Add clarifying question for TIER 3 (ambiguous queries)
+
+def validate_llm_answer(answer: str, hits: list[dict], exact_match: bool, tier: QueryTier | None = None) -> str:
+    del exact_match
+    if not hits:
+        return NO_RESULTS_MESSAGE
+
+    cleaned = re.sub(r"<[^>]+>", "", answer or "").strip()
+    if not cleaned:
+        return _build_fallback_answer(hits, tier=tier)
+
+    lowered = cleaned.lower()
+    banned_phrases = ["i couldn't find", "i could not find",
+                      "no items", "no products", "sorry"]
+    if any(phrase in lowered for phrase in banned_phrases):
+        return _build_fallback_answer(hits, tier=tier)
+
+    if "http://" in lowered or "https://" in lowered:
+        return _build_fallback_answer(hits, tier=tier)
+
+    if not _mentions_known_product(cleaned, hits):
+        return _build_fallback_answer(hits, tier=tier)
+
+    result = cleaned
     if tier == QueryTier.TIER3_AMBIGUOUS and should_add_clarifying_question(tier):
         question = get_clarifying_question(tier)
-        result = f"{result}\n\n{question}"
+        if question.lower() not in lowered:
+            result = f"{result}\n\n{question}"
 
     return result

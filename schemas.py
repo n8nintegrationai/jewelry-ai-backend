@@ -6,7 +6,7 @@ from app_constants import ALLOWED_MESSAGE_RE
 
 class Query(BaseModel):
     message: str
-    stream: bool = False
+    stream: bool = True
     session_id: str
     chat_history: list[dict] = []
 

@@ -53,7 +53,8 @@ def load_settings() -> Settings:
             "MODEL_NAME", "sentence-transformers/all-MiniLM-L6-v2"),
         ollama_url=os.getenv(
             "OLLAMA_URL", "http://localhost:11434/api/generate"),
-        ollama_model=os.getenv("OLLAMA_MODEL", "gemma4:e2b"),
+        ollama_model=os.getenv("OLLAMA_MODEL", "phi3"),
+        # ollama_model=os.getenv("OLLAMA_MODEL", "gemma4:e2b"),
         products_url=os.getenv(
             "PRODUCTS_URL",
             "https://raw.githubusercontent.com/n8nintegrationai/luvz-collection-dev/refs/heads/main/public/data/products.json",

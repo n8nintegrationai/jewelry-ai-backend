@@ -17,12 +17,15 @@ from dependencies import create_limiter, lifespan, runtime
 from query_classifier import QueryTier, classify_query, is_product_query
 from schemas import Query
 from services import (
+    apply_price_filter,
     build_context,
+    build_price_filter_no_results_message,
     build_llm_payload,
     build_sources,
     cosine_search,
     extract_constraints,
     find_exact_name_matches,
+    get_previous_context,
     validate_llm_answer,
 )
 from session_store import session_store
@@ -67,33 +70,23 @@ def _count_tokens(text: str) -> int:
     return len(text.split())
 
 
-def _extract_previous_category(chat_history: list[dict]) -> str | None:
-    """
-    Extract the category keyword from the previous user or assistant message.
-    Returns the category (e.g., 'jhumka', 'bangle') if found, None otherwise.
-    """
-    if not chat_history:
-        return None
+def _resolve_session_history(query: Query) -> list[dict]:
+    request_history = query.chat_history or []
+    stored_history = session_store.get_history(query.session_id)
+    return request_history or stored_history
 
-    # Look through history from most recent backwards
-    for i in range(len(chat_history) - 1, -1, -1):
-        msg = chat_history[i]
-        content = msg.get("content", "").lower()
 
-        # Check for category keywords (from query_classifier.py TIER1_CATEGORIES)
-        categories = {
-            "jhumka", "jhumkas", "bangle", "bangles", "churi", "churis",
-            "kada", "kadas", "necklace", "necklaces", "mala", "malas",
-            "ring", "rings", "earring", "earrings", "bracelet", "bracelets",
-            "chain", "chains", "pendant", "pendants", "tikka", "tikkas",
-            "payal", "payals", "anklet", "anklets",
-        }
+def _format_history_fallback_answer(hits: list[dict]) -> str:
+    lines = ["Here are more options similar to what we were looking at:"]
+    for hit in hits:
+        name = str(hit.get("name", "Product")).strip() or "Product"
+        price = str(hit.get("price", "")).strip()
+        lines.append(f"{name} ({price})" if price else name)
+    return "\n".join(lines)
 
-        for category in categories:
-            if category in content:
-                return category
 
-    return None
+def _budget_context_prompt() -> str:
+    return "What type of jewelry are you looking for within that budget?"
 
 
 def _get_top_similarity_score(query: str) -> float:
@@ -196,8 +189,60 @@ async def health():
 @limiter.limit(settings.chat_rate_limit)
 async def chat(request: Request, query: Query):
     total_start_time = time.perf_counter()
+    session_history = _resolve_session_history(query)
+    previous_assistant_message = ""
+    for history_message in reversed(session_history):
+        if str(history_message.get("role", "")).lower() == "assistant":
+            previous_assistant_message = str(history_message.get("content", ""))
+            break
+
+    constraints = extract_constraints(query.message, previous_assistant_message)
+    is_followup = constraints.get("is_followup", False)
+    is_price_filter = constraints.get("is_price_filter", False)
+    previous_context = (
+        get_previous_context(session_history)
+        if session_history else {
+            "last_category": None,
+            "last_query": None,
+            "last_items_shown": [],
+            "last_max_price": None,
+        }
+    )
+    history_category = previous_context.get("last_category")
+    history_query = previous_context.get("last_query") or history_category
+    active_max_price = constraints.get("max_price")
+    if active_max_price is None and is_followup:
+        active_max_price = previous_context.get("last_max_price")
+        if active_max_price is not None:
+            constraints["max_price"] = active_max_price
 
     if not is_product_query(query.message):
+        if session_history:
+            if history_query:
+                logger.info(
+                    f"[FALLBACK] using session history context: {history_query}")
+                fallback_tier, fallback_enriched_query = classify_query(history_query)
+                fallback_search_query = fallback_enriched_query or history_query
+                fallback_hits = find_exact_name_matches(history_query) or cosine_search(
+                    fallback_search_query,
+                    tier=fallback_tier,
+                    original_query=history_query,
+                    constraints=constraints,
+                )
+                if fallback_hits:
+                    fallback_sources = build_sources(fallback_hits)
+                    return StreamingResponse(
+                        _stream_static_response(
+                            _format_history_fallback_answer(fallback_hits),
+                            fallback_sources,
+                        ),
+                        media_type="text/event-stream",
+                        headers={
+                            "Cache-Control": "no-cache",
+                            "X-Accel-Buffering": "no",
+                        },
+                    )
+
         return StreamingResponse(
             _stream_static_response(OFF_TOPIC_MESSAGE, []),
             media_type="text/event-stream",
@@ -209,59 +254,115 @@ async def chat(request: Request, query: Query):
 
     # TIMING 1: Query classification
     t_start = time.perf_counter()
-    tier, enriched_query = classify_query(query.message)
+    search_seed = query.message
+    top_k_override = None
+    needs_history_context = bool(active_max_price is not None or is_followup)
+    if needs_history_context and not history_category:
+        return StreamingResponse(
+            _stream_static_response(_budget_context_prompt(), []),
+            media_type="text/event-stream",
+            headers={
+                "Cache-Control": "no-cache",
+                "X-Accel-Buffering": "no",
+            },
+        )
+
+    if (is_price_filter or is_followup) and history_category:
+        if active_max_price is not None:
+            search_seed = f"{history_category} under {active_max_price}"
+            logger.info(
+                f"[PRICE_FILTER] applying max_price:{active_max_price} to previous category:{history_category}")
+            top_k_override = settings.top_k + 6
+        else:
+            search_seed = history_query or history_category
+            logger.info(
+                f"[FOLLOWUP] detected, searching with previous context: {search_seed}")
+            top_k_override = settings.top_k + 3
+    elif active_max_price is not None:
+        top_k_override = settings.top_k + 6
+
+    tier, enriched_query = classify_query(search_seed)
+    if top_k_override is None and tier == QueryTier.TIER3_AMBIGUOUS:
+        top_k_override = 3
     t_classify = (time.perf_counter() - t_start) * 1000
     logger.info(f"[TIMING] query_classification: {t_classify:.0f}ms")
 
-    search_query = enriched_query if enriched_query else query.message
+    search_query = enriched_query if enriched_query else search_seed
 
     # TIMING 2: Exact name match
     t_start = time.perf_counter()
-    exact_hits = find_exact_name_matches(query.message)
+    exact_hits = find_exact_name_matches(search_seed)
     t_exact = (time.perf_counter() - t_start) * 1000
     logger.info(f"[TIMING] exact_name_match: {t_exact:.0f}ms")
-
-    # Extract constraints to check for follow-up intent
-    constraints = extract_constraints(query.message)
-    is_followup = constraints.get("is_followup", False)
 
     # TIMING 3: Cosine search with vector search + price filtering
     t_start = time.perf_counter()
     hits = exact_hits or cosine_search(
         search_query,
-        k=3 if tier == QueryTier.TIER3_AMBIGUOUS else None,
+        k=top_k_override,
         tier=tier,
-        original_query=query.message,
-        constraints=constraints,
+        original_query=search_seed,
     )
     t_vector_search = (time.perf_counter() - t_start) * 1000
     logger.info(f"[TIMING] vector_search: {t_vector_search:.0f}ms")
 
     # TIMING 3b: Context-aware fallback for low-confidence follow-up queries
-    if is_followup and not exact_hits and hits:
+    if (is_followup or is_price_filter) and not exact_hits and hits:
         t_start_fallback = time.perf_counter()
         top_score = _get_top_similarity_score(search_query)
 
         # If low confidence and we have session history with a previous category
         if top_score < 0.3:
-            previous_category = _extract_previous_category(query.chat_history)
+            previous_category = history_category
             if previous_category:
                 logger.info(
                     f"[FALLBACK] low confidence query (score={top_score:.2f}), using previous category: {previous_category}")
 
                 # Re-run vector search with the previous category
+                fallback_query = previous_category
+                if active_max_price is not None:
+                    fallback_query = f"{previous_category} under {active_max_price}"
                 fallback_hits = cosine_search(
-                    previous_category,
-                    k=5 if tier == QueryTier.TIER3_AMBIGUOUS else None,
+                    fallback_query,
+                    k=settings.top_k + 3,
                     tier=tier,
-                    original_query=previous_category,
-                    constraints=constraints,
+                    original_query=fallback_query,
                 )
                 if fallback_hits:
                     hits = fallback_hits
 
         t_fallback = (time.perf_counter() - t_start_fallback) * 1000
         logger.info(f"[TIMING] fallback_check: {t_fallback:.0f}ms")
+
+    if active_max_price is not None and hits:
+        t_start = time.perf_counter()
+        price_filter_result = apply_price_filter(hits, active_max_price)
+        t_price_filter = (time.perf_counter() - t_start) * 1000
+        logger.info(f"[TIMING] price_filtering: {t_price_filter:.0f}ms")
+
+        if price_filter_result["hits"]:
+            hits = price_filter_result["hits"]
+            if price_filter_result["relaxed"]:
+                relaxed_price = price_filter_result["relaxed_price"]
+                if relaxed_price is not None:
+                    logger.info(
+                        f"[PRICE_FILTER] no hits under {active_max_price}, relaxed to {relaxed_price:.0f}")
+        else:
+            category_label = history_category or search_seed
+            closest_sources = build_sources(hits)
+            answer = build_price_filter_no_results_message(
+                category_label,
+                active_max_price,
+                price_filter_result["lowest_price"],
+            )
+            return StreamingResponse(
+                _stream_static_response(answer, closest_sources),
+                media_type="text/event-stream",
+                headers={
+                    "Cache-Control": "no-cache",
+                    "X-Accel-Buffering": "no",
+                },
+            )
 
     # TIMING 4: Build sources
     t_start = time.perf_counter()
@@ -272,6 +373,29 @@ async def chat(request: Request, query: Query):
     # For TIER3 (ambiguous), we should never return empty
     # cosine_search ensures this, but as safety check:
     if not hits:
+        if active_max_price is not None and history_category:
+            answer = build_price_filter_no_results_message(
+                history_category,
+                active_max_price,
+                None,
+            )
+            return StreamingResponse(
+                _stream_static_response(answer, []),
+                media_type="text/event-stream",
+                headers={
+                    "Cache-Control": "no-cache",
+                    "X-Accel-Buffering": "no",
+                },
+            )
+        if needs_history_context:
+            return StreamingResponse(
+                _stream_static_response(_budget_context_prompt(), []),
+                media_type="text/event-stream",
+                headers={
+                    "Cache-Control": "no-cache",
+                    "X-Accel-Buffering": "no",
+                },
+            )
         return StreamingResponse(
             _stream_static_response(NO_RESULTS_MESSAGE, []),
             media_type="text/event-stream",

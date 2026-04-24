@@ -39,4 +39,5 @@ INSTRUCTIONS:
     - "Would you like me to filter these by budget?"
     - "Shall I show you more [category] options?"
     - "Would you like to see a different category?"
+12. When showing items, never suggest the user ask for "more" or "similar" unless you are certain the catalog has more items in that category. Instead end with: "Would you like to filter these by budget or occasion?" or "Shall I show you a different category?"
 """

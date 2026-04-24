@@ -7,13 +7,149 @@ import numpy as np
 from app_config import settings
 from app_constants import NO_RESULTS_MESSAGE, SYSTEM_PROMPT
 from dependencies import runtime
-from query_classifier import QueryTier, get_clarifying_question, should_add_clarifying_question
+from query_classifier import QueryTier, TIER1_CATEGORIES, get_clarifying_question, should_add_clarifying_question
 
 logger = logging.getLogger(__name__)
+
+FOLLOWUP_INTENT_TRIGGERS = {
+    "more",
+    "yes",
+    "ok",
+    "okay",
+    "sure",
+    "show",
+    "those",
+    "them",
+    "tell me more",
+    "see more",
+    "show more",
+    "more please",
+    "more options",
+    "show me more",
+    "yes please",
+    "go ahead",
+    "more of those",
+    "similar",
+    "others",
+    "what else",
+    "anything else",
+}
+
+FOLLOWUP_FILLER_WORDS = {"please", "pls", "plz", "now", "again"}
 
 
 def _normalize_text(value: str) -> str:
     return re.sub(r"[^a-z0-9]+", " ", value.lower()).strip()
+
+
+def _is_followup_primary_message(message: str) -> bool:
+    normalized_message = _normalize_text(message)
+    if not normalized_message:
+        return False
+
+    if normalized_message in FOLLOWUP_INTENT_TRIGGERS:
+        return True
+
+    for trigger in sorted(FOLLOWUP_INTENT_TRIGGERS, key=len, reverse=True):
+        if normalized_message.startswith(f"{trigger} "):
+            remainder = normalized_message[len(trigger):].strip()
+            if remainder and set(remainder.split()) <= FOLLOWUP_FILLER_WORDS:
+                return True
+
+    return False
+
+
+def _extract_category_phrase(text: str) -> str | None:
+    tokens = _normalize_text(text).split()
+    if not tokens:
+        return None
+
+    for index in range(len(tokens) - 1, -1, -1):
+        token = tokens[index]
+        if token in TIER1_CATEGORIES:
+            start = max(0, index - 2)
+            return " ".join(tokens[start:index + 1])
+
+    return None
+
+
+def _extract_item_names(text: str) -> list[str]:
+    normalized_text = _normalize_text(text)
+    if not normalized_text or not runtime.catalog:
+        return []
+
+    matches: list[tuple[int, str]] = []
+    for product in runtime.catalog:
+        name = str(product.get("name", "")).strip()
+        normalized_name = _normalize_text(name)
+        if name and normalized_name and normalized_name in normalized_text:
+            matches.append((len(normalized_name), name))
+
+    matches.sort(key=lambda item: item[0], reverse=True)
+    unique_names: list[str] = []
+    seen_names: set[str] = set()
+    for _, name in matches:
+        lowered = name.lower()
+        if lowered not in seen_names:
+            unique_names.append(name)
+            seen_names.add(lowered)
+
+    return unique_names
+
+
+def _message_has_category(message: str) -> bool:
+    tokens = set(_normalize_text(message).split())
+    return bool(tokens & TIER1_CATEGORIES)
+
+
+def get_previous_context(history: list) -> dict:
+    recent_history = history[-6:] if history else []
+    context = {
+        "last_category": None,
+        "last_query": None,
+        "last_items_shown": [],
+        "last_max_price": None,
+    }
+
+    for message in reversed(recent_history):
+        role = str(message.get("role", "")).lower()
+        content = str(message.get("content", "")).strip()
+        if not content:
+            continue
+
+        if role == "assistant" and not context["last_items_shown"]:
+            context["last_items_shown"] = _extract_item_names(content)
+
+        extracted_category = _extract_category_phrase(content)
+        if extracted_category and not context["last_category"]:
+            context["last_category"] = extracted_category
+
+        if role == "user":
+            message_constraints = extract_constraints(content)
+            if (
+                message_constraints.get("max_price") is not None
+                and context["last_max_price"] is None
+            ):
+                context["last_max_price"] = message_constraints["max_price"]
+
+            if (
+                not context["last_query"]
+                and not message_constraints.get("is_followup")
+                and not message_constraints.get("is_price_filter")
+            ):
+                context["last_query"] = content
+                if not context["last_category"]:
+                    context["last_category"] = _extract_category_phrase(content)
+
+        if context["last_query"] and context["last_category"] and context["last_items_shown"]:
+            break
+
+    if not context["last_category"] and context["last_items_shown"]:
+        context["last_category"] = _extract_category_phrase(
+            context["last_items_shown"][0]
+        )
+
+    return context
 
 
 def extract_constraints(message: str, previous_assistant_message: str = "") -> dict:
@@ -42,70 +178,65 @@ def extract_constraints(message: str, previous_assistant_message: str = "") -> d
         previous_assistant_message: Previous assistant response for context
 
     Returns:
-        Dict with optional keys: 'max_price', 'is_followup'
+        Dict with optional keys: 'max_price', 'is_followup', 'is_price_filter'
     """
     msg_lower = message.lower().strip()
-    result = {}
+    result = {"is_price_filter": False}
 
     # Detect follow-up intents
     followup_keywords = {
-        "matching pieces", "show me more", "similar ones", "yes please",
-        "those ones", "show more", "more options", "yes", "ok show me",
-        "similar", "like that", "same style", "more like this",
-        "show matching", "matching"
+        "matching pieces", "similar ones", "those ones", "ok show me",
+        "like that", "same style", "more like this", "show matching", "matching",
     }
 
-    for keyword in followup_keywords:
-        if keyword in msg_lower:
-            result["is_followup"] = True
-            break
+    result["is_followup"] = _is_followup_primary_message(message)
+    if not result["is_followup"]:
+        for keyword in followup_keywords:
+            if keyword in msg_lower:
+                result["is_followup"] = True
+                break
 
-    if "is_followup" not in result:
-        result["is_followup"] = False
+    def _set_price_constraint(value: int) -> dict:
+        result["max_price"] = value
+        result["is_price_filter"] = not _message_has_category(message)
+        return result
 
     # Pattern 1: "budget 500" or "budget of 500"
     match = re.search(r'budget\s+(?:of\s+)?(\d+)', msg_lower)
     if match:
-        result["max_price"] = int(match.group(1))
-        return result
+        return _set_price_constraint(int(match.group(1)))
 
     # Pattern 2: "500 budget"
     match = re.search(r'(\d+)\s+budget', msg_lower)
     if match:
-        result["max_price"] = int(match.group(1))
-        return result
+        return _set_price_constraint(int(match.group(1)))
 
     # Pattern 3: "my budget is 500"
     match = re.search(r'my\s+budget\s+is\s+(\d+)', msg_lower)
     if match:
-        result["max_price"] = int(match.group(1))
-        return result
+        return _set_price_constraint(int(match.group(1)))
 
     # Pattern 4: "budget around 500"
     match = re.search(r'budget\s+around\s+(\d+)', msg_lower)
     if match:
-        result["max_price"] = int(match.group(1))
-        return result
+        return _set_price_constraint(int(match.group(1)))
 
     # Pattern 5: "around 500" or "roughly 500"
     match = re.search(r'(?:around|roughly|approximately)\s+(\d+)', msg_lower)
     if match:
-        result["max_price"] = int(match.group(1))
-        return result
+        return _set_price_constraint(int(match.group(1)))
 
     # Pattern 6a: "rs 500" or "rs. 500" or "rupees 500"
     match = re.search(r'(?:rs\.?|rupees?)\s+(\d+)', msg_lower)
     if match:
-        result["max_price"] = int(match.group(1))
-        return result
+        return _set_price_constraint(int(match.group(1)))
 
     # Pattern 6b: "500 rupees" or "500 rs" or "500₹" or "₹500"
     match = re.search(r'(?:₹\s*)?(\d+)\s*(?:rupees?|rs\.?|₹)?', msg_lower)
     if match:
         # Only return if we found rupees/rs in the message to avoid false positives
         if re.search(r'(\d+)\s*(?:rupees?|rs\.?|₹)|₹\s*(\d+)|(\d+)\s*₹', msg_lower):
-            result["max_price"] = int(match.group(1))
-            return result
+            return _set_price_constraint(int(match.group(1)))
 
     # Pattern 7: Standalone number when previous message mentioned budget keywords
     budget_keywords = ["budget", "price", "range", "narrow", "style"]
@@ -114,14 +245,12 @@ def extract_constraints(message: str, previous_assistant_message: str = "") -> d
         # Check if message is just a number
         stripped = msg_lower.strip()
         if re.match(r'^\d+$', stripped):
-            result["max_price"] = int(stripped)
-            return result
+            return _set_price_constraint(int(stripped))
 
     # Pattern 8: "under 500"
     match = re.search(r'under\s+(\d+)', msg_lower)
     if match:
-        result["max_price"] = int(match.group(1))
-        return result
+        return _set_price_constraint(int(match.group(1)))
 
     return result
 
@@ -264,42 +393,6 @@ def cosine_search(query: str, k: int | None = None, tier: QueryTier | None = Non
                     scores[valid_indices])[::-1][:limit]]
                 hits = [runtime.catalog[i] for i in top_idx]
 
-    # Apply price filter if constraints provided
-    if constraints and constraints.get("max_price"):
-        t_filter_start = time.perf_counter()
-        max_price = constraints["max_price"]
-        filtered_hits = []
-        for hit in hits:
-            price_str = str(hit.get("price", "")).replace(",", "")
-            try:
-                price = float(price_str)
-                if price <= max_price:
-                    filtered_hits.append(hit)
-            except ValueError:
-                # If price not parseable, include it
-                filtered_hits.append(hit)
-
-        # If filter leaves fewer than 2 results, relax by 20%
-        if len(filtered_hits) < 2 and max_price > 0:
-            relaxed_price = max_price * 1.2
-            filtered_hits = []
-            for hit in hits:
-                price_str = str(hit.get("price", "")).replace(",", "")
-                try:
-                    price = float(price_str)
-                    if price <= relaxed_price:
-                        filtered_hits.append(hit)
-                except ValueError:
-                    filtered_hits.append(hit)
-
-        # Never return empty results - if still empty, return original hits
-        if not filtered_hits:
-            filtered_hits = hits
-
-        hits = filtered_hits
-        t_filter = (time.perf_counter() - t_filter_start) * 1000
-        logger.info(f"[TIMING] price_filtering: {t_filter:.0f}ms")
-
     search_total = (time.perf_counter() - search_start) * 1000
     logger.info(f"[TIMING] cosine_search_total: {search_total:.0f}ms")
 
@@ -317,6 +410,78 @@ def _format_price(price: object) -> str:
     if "₹" not in price_str and "rs" not in price_str.lower():
         return f"₹{price_str}"
     return price_str
+
+
+def _parse_price_value(price: object) -> float | None:
+    if price is None or price == "":
+        return None
+
+    normalized = re.sub(r"[^\d.]+", "", str(price))
+    if not normalized:
+        return None
+
+    try:
+        return float(normalized)
+    except ValueError:
+        return None
+
+
+def _lowest_price_value(hits: list[dict]) -> float | None:
+    prices = [
+        parsed_price
+        for hit in hits
+        if (parsed_price := _parse_price_value(hit.get("price"))) is not None
+    ]
+    return min(prices) if prices else None
+
+
+def apply_price_filter(hits: list[dict], max_price: int) -> dict:
+    def _filter(limit: float) -> list[dict]:
+        filtered_hits: list[dict] = []
+        for hit in hits:
+            parsed_price = _parse_price_value(hit.get("price"))
+            if parsed_price is not None and parsed_price <= limit:
+                filtered_hits.append(hit)
+        return filtered_hits
+
+    filtered_hits = _filter(max_price)
+    if filtered_hits:
+        return {
+            "hits": filtered_hits,
+            "relaxed": False,
+            "relaxed_price": None,
+            "lowest_price": _lowest_price_value(hits),
+        }
+
+    relaxed_price = max_price * 1.2 if max_price > 0 else max_price
+    relaxed_hits = _filter(relaxed_price) if max_price > 0 else []
+    if relaxed_hits:
+        return {
+            "hits": relaxed_hits,
+            "relaxed": True,
+            "relaxed_price": relaxed_price,
+            "lowest_price": _lowest_price_value(hits),
+        }
+
+    return {
+        "hits": [],
+        "relaxed": False,
+        "relaxed_price": None,
+        "lowest_price": _lowest_price_value(hits),
+    }
+
+
+def build_price_filter_no_results_message(category: str, max_price: int, lowest_price: float | None) -> str:
+    budget_text = _format_price(max_price)
+    if lowest_price is None:
+        return f"I couldn't find {category} items under {budget_text}. Would you like to try a different budget?"
+
+    closest_price = int(lowest_price) if float(lowest_price).is_integer() else round(lowest_price, 2)
+    return (
+        f"I couldn't find {category} items under {budget_text}. "
+        f"Our closest options start at {_format_price(closest_price)}. "
+        "Would you like to see those?"
+    )
 
 
 def _format_description(description: object) -> str:
@@ -469,3 +634,4 @@ def validate_llm_answer(answer: str, hits: list[dict], exact_match: bool, tier: 
             result = f"{result}\n\n{question}"
 
     return result
+

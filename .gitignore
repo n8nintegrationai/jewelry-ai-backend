@@ -24,3 +24,5 @@ __pycache__/
 dist/
 build/
 *.egg-info/
+
+job_context.json

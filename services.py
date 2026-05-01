@@ -5,7 +5,7 @@ import time
 import numpy as np
 
 from app_config import settings
-from app_constants import NO_RESULTS_MESSAGE, SYSTEM_PROMPT
+from app_constants import NO_RESULTS_MESSAGE
 from dependencies import runtime
 from query_classifier import QueryTier, TIER1_CATEGORIES, get_clarifying_question, should_add_clarifying_question
 
@@ -503,18 +503,16 @@ def _format_product_line(hit: dict) -> str:
 
 def build_context(hits: list[dict]) -> str:
     entries: list[str] = []
-    for index, hit in enumerate(hits, start=1):
-        entries.append(
-            "\n".join(
-                [
-                    f"Item {index}",
-                    f"Name: {hit.get('name', 'Product')}",
-                    f"Price: {_format_price(hit.get('price'))}",
-                    f"Description: {_format_description(hit.get('description'))}",
-                ]
-            )
-        )
-    return "\n\n".join(entries)
+    for hit in hits[:2]:
+        name = hit.get("name", "Product")
+        price = str(hit.get("price", "")).strip()
+        entry = f"{name}, ₹{price}"
+        whatsapp_number = str(hit.get("whatsapp_number", "")).strip()
+        if whatsapp_number:
+            sanitized_number = whatsapp_number.replace("+", "").replace(" ", "")
+            entry = f"{entry}, wa.me/{sanitized_number}"
+        entries.append(entry)
+    return " | ".join(entries)
 
 
 def build_sources(hits: list[dict]) -> list[dict]:
@@ -542,7 +540,6 @@ def build_llm_payload(message: str, context: str, exact_match: bool, tier: Query
     tier_name = tier.value if tier else "semantic"
     prompt = (
         "system\n"
-        f"{SYSTEM_PROMPT}\n\n"
         "user\n"
         f"TIER: {tier_name}\n"
         f"MODE: {mode}\n"

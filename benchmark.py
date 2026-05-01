@@ -20,7 +20,6 @@ import numpy as np
 from sentence_transformers import SentenceTransformer
 
 from app_config import settings
-from app_constants import SYSTEM_PROMPT
 from dependencies import CatalogRuntime, runtime
 from query_classifier import QueryTier, classify_query
 import services

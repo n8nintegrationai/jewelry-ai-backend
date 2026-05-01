@@ -12,7 +12,7 @@ services:
       APP_ENV: prod
       MODEL_NAME: sentence-transformers/all-MiniLM-L6-v2
       OLLAMA_URL: http://172.17.0.1:11434/api/generate
-      OLLAMA_MODEL: phi3
+      OLLAMA_MODEL: luvz-fast
       EMBEDDINGS_FILE: /app/embeddings.json
       CORS_ALLOW_ORIGINS: https://luvzcollection.com,https://www.luvzcollection.com
       ALLOWED_ORIGINS: https://luvzcollection.com,https://www.luvzcollection.com

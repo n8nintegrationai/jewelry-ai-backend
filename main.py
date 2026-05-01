@@ -54,6 +54,34 @@ app.add_middleware(
 app.state.limiter = limiter
 app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 
+BASE_RULES = (
+    "You are Luvz Style Assistant for a silver jewelry store in India. "
+    "Use only INVENTORY products. Never invent names, prices, facts. "
+    "No links, URLs, markdown, emojis. Plain text only. "
+    "Short, warm shopkeeper sentences. Ships across India. Returns via WhatsApp."
+)
+
+TIER_INSTRUCTIONS = {
+    "tier1": (
+        "Customer wants a specific item or has a budget. "
+        "Present matching item name and price naturally. "
+        "End with exactly one of: "
+        "\"Would you like to filter by budget?\" "
+        "\"Shall I show you more [category] options?\""
+    ),
+    "tier2": (
+        "Customer has occasion or style in mind. "
+        "Present items as curated picks, one sentence per item explaining why it fits using only the item description. "
+        "End with: \"Would you like to filter these by budget or occasion?\""
+    ),
+    "tier3": (
+        "Vague request. "
+        "Show top 2 items from INVENTORY with name and price. "
+        "Ask exactly ONE clarifying question about budget or occasion. "
+        "Never say \"I couldn't find\" or any variation."
+    ),
+}
+
 
 def _sse_event(event_name: str, data: dict) -> str:
     return f"event: {event_name}\ndata: {json.dumps(data, ensure_ascii=False)}\n\n"
@@ -87,6 +115,43 @@ def _format_history_fallback_answer(hits: list[dict]) -> str:
 
 def _budget_context_prompt() -> str:
     return "What type of jewelry are you looking for within that budget?"
+
+
+def build_system_prompt(tier: str, context: str) -> str:
+    # Builds the final system prompt from shared rules, tier guidance, and inventory.
+    """Build the grounded system prompt for the selected query tier."""
+    return f"{BASE_RULES}\n\n{TIER_INSTRUCTIONS[tier]}\n\nINVENTORY:\n{context}"
+
+
+def classify_tier(query: str, hits: list[dict]) -> str:
+    # Chooses the response tier from exact product names, budgets, and vague terms.
+    """Classify the customer query into the prompt tier used for response style."""
+    query_lower = query.lower()
+    if any(
+        (name := str(hit.get("name", "")).strip().lower()) and name in query_lower
+        for hit in hits
+    ):
+        return "tier1"
+    if re.search(r"\d", query):
+        return "tier1"
+
+    vague_terms = [
+        "something",
+        "anything",
+        "gift",
+        "suggest",
+        "idea",
+        "help",
+        "nice",
+        "good",
+        "popular",
+        "best",
+        "show me",
+    ]
+    if len(query.split()) <= 2 or any(term in query_lower for term in vague_terms):
+        return "tier3"
+
+    return "tier2"
 
 
 def _get_top_similarity_score(query: str) -> float:
@@ -292,7 +357,7 @@ async def chat(request: Request, query: Query):
 
     tier, enriched_query = classify_query(search_seed)
     if top_k_override is None and tier == QueryTier.TIER3_AMBIGUOUS:
-        top_k_override = 3
+        top_k_override = 2
     t_classify = (time.perf_counter() - t_start) * 1000
     logger.info(f"[TIMING] query_classification: {t_classify:.0f}ms")
 
@@ -416,7 +481,9 @@ async def chat(request: Request, query: Query):
 
     # TIMING 5: Build context
     t_start = time.perf_counter()
+    response_tier = classify_tier(query.message, hits)
     context = build_context(hits)
+    system_prompt = build_system_prompt(response_tier, context)
     t_context = (time.perf_counter() - t_start) * 1000
     logger.info(f"[TIMING] prompt_build: {t_context:.0f}ms")
 
@@ -425,8 +492,24 @@ async def chat(request: Request, query: Query):
 
     # TIMING 6: Build LLM payload
     t_start = time.perf_counter()
-    payload = build_llm_payload(
-        query.message, context, exact_match=bool(exact_hits), tier=tier)
+    prompt = (
+        "system\n"
+        f"{system_prompt}\n\n"
+        "user\n"
+        f"CUSTOMER_MESSAGE: {query.message}\n\n"
+        "assistant\n"
+    )
+    payload = {
+        "model": "luvz-fast",
+        "prompt": prompt,
+        "stream": False,
+        "options": {
+            "temperature": 0,
+            "top_k": 1,
+            "num_predict": 100,
+            "num_ctx": 1024,
+        },
+    }
     t_payload = (time.perf_counter() - t_start) * 1000
     logger.info(f"[TIMING] build_llm_payload: {t_payload:.0f}ms")
 

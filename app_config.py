@@ -61,14 +61,14 @@ def load_settings() -> Settings:
         model_name=os.getenv(
             "MODEL_NAME", "sentence-transformers/all-MiniLM-L6-v2"),
         ollama_url=os.getenv("OLLAMA_URL", default_ollama_url),
-        ollama_model=os.getenv("OLLAMA_MODEL", "phi3"),
+        ollama_model=os.getenv("OLLAMA_MODEL", "luvz-fast"),
         # ollama_model=os.getenv("OLLAMA_MODEL", "gemma4:e2b"),
         products_url=os.getenv(
             "PRODUCTS_URL",
             "https://raw.githubusercontent.com/n8nintegrationai/luvz-collection-dev/refs/heads/main/public/data/products.json",
         ),
         embeddings_file=Path(os.getenv("EMBEDDINGS_FILE", "embeddings.json")),
-        top_k=int(os.getenv("TOP_K", "3")),
+        top_k=int(os.getenv("TOP_K", "2")),
         max_input_chars=int(os.getenv("MAX_INPUT_CHARS", "400")),
         similarity_threshold=float(os.getenv("SIMILARITY_THRESHOLD", "0.40")),
         default_whatsapp=os.getenv("DEFAULT_WHATSAPP", "919876543210"),

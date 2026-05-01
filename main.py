@@ -105,12 +105,21 @@ def _get_top_similarity_score(query: str) -> float:
     return 0.0
 
 
+def _llm_timeout() -> httpx.Timeout:
+    return httpx.Timeout(
+        connect=settings.llm_connect_timeout_seconds,
+        read=settings.llm_read_timeout_seconds,
+        write=settings.llm_write_timeout_seconds,
+        pool=settings.llm_pool_timeout_seconds,
+    )
+
+
 async def _stream_ollama_response(payload: dict, sources: list[dict]):
     start_request_time = time.perf_counter()
     first_chunk_time = None
     response_text = ""
 
-    async with httpx.AsyncClient(timeout=settings.llm_timeout_seconds) as client:
+    async with httpx.AsyncClient(timeout=_llm_timeout()) as client:
         try:
             try:
                 async with client.stream(

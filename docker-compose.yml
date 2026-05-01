@@ -11,14 +11,17 @@ services:
     environment:
       APP_ENV: prod
       MODEL_NAME: sentence-transformers/all-MiniLM-L6-v2
-      OLLAMA_URL: http://host.docker.internal:11434/api/generate
+      OLLAMA_URL: http://172.17.0.1:11434/api/generate
       OLLAMA_MODEL: phi3
       EMBEDDINGS_FILE: /app/embeddings.json
       CORS_ALLOW_ORIGINS: https://luvzcollection.com,https://www.luvzcollection.com
       ALLOWED_ORIGINS: https://luvzcollection.com,https://www.luvzcollection.com
       DEFAULT_RATE_LIMIT: 30/minute
       CHAT_RATE_LIMIT: 15/minute
-      LLM_TIMEOUT_SECONDS: "60"
+      LLM_CONNECT_TIMEOUT_SECONDS: "10"
+      LLM_READ_TIMEOUT_SECONDS: "180"
+      LLM_POOL_TIMEOUT_SECONDS: "5"
+
     volumes:
       - ./embeddings.json:/app/embeddings.json:ro
     ports:

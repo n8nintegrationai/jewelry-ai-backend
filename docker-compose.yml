@@ -23,7 +23,7 @@ services:
       LLM_POOL_TIMEOUT_SECONDS: "5"
 
     volumes:
-      - ./embeddings.json:/app/embeddings.json:ro
+      - ./embeddings.json:/app/embeddings.json:rw
     ports:
       - "0.0.0.0:8000:8000"
     healthcheck:
